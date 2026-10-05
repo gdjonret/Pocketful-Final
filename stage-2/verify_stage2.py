@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import concurrent.futures, datetime, json, os, time, urllib.error, urllib.request
+import concurrent.futures, copy, datetime, json, os, time, urllib.error, urllib.request
 BASE=os.getenv("BASE_URL","http://127.0.0.1:18081")
 def call(method,path,body=None,token=None,key=None,accept=None):
     h={};data=None
@@ -44,6 +44,11 @@ time.sleep(2.2)
 expired=[x for x in call("GET","/authorizations",token=tok["ada"])[1]["authorizations"] if x["authorization_id"]==e["authorization_id"]][0];assert expired["status"]=="expired" and expired["remaining_amount"]==0
 assert call("POST",f'/authorizations/{e["authorization_id"]}/capture',{},tok["bob"],"expired-cap")[1]["error"]["code"]=="authorization_expired"
 exported=call("GET","/_test/export")[1];before=call("GET","/me",token=tok["ada"])[1]
+contradictory=copy.deepcopy(exported)
+record=contradictory["state"]["authorizations"][a["authorization_id"]]
+record["payment_ids"]=[];record["payment_id"]=None;record["captured_amount"]=0
+assert call("POST","/_test/import",contradictory)[0]==422
+assert call("GET","/me",token=tok["ada"])[1]==before
 assert call("POST","/_test/import",exported)[0]==204
 assert call("GET","/me",token=tok["ada"])[1]==before
 assert call("POST",f'/authorizations/{a["authorization_id"]}/capture',{"amount":700,"final":False},tok["bob"],"cap-1")[:2]==(200,p1)

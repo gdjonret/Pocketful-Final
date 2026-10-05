@@ -794,6 +794,11 @@ func (s *Server) validState(st *State) bool {
 			if a.PaymentID != nil || a.CapturedAmount != 0 {
 				return false
 			}
+			for _, p := range st.Payments {
+				if p.AuthorizationID != nil && *p.AuthorizationID == a.ID {
+					return false
+				}
+			}
 		} else {
 			if a.PaymentID == nil || *a.PaymentID != a.PaymentIDs[len(a.PaymentIDs)-1] {
 				return false
