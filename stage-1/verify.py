@@ -89,6 +89,8 @@ assert len({json.dumps(x, sort_keys=True) for _,x in results}) == 1
 assert call("GET", "/me", token=tokens["ada"])[1]["balance"] == before - 7
 
 # Export/import restores balances, credentials, tokens, resources and retry receipts.
+activity_order = [p["payment_id"] for p in call("GET", "/activity", token=tokens["ada"])[1]["payments"]]
+request_order = [q["request_id"] for q in call("GET", "/requests", token=tokens["ada"])[1]["requests"]]
 s, exported = call("GET", "/_test/export")
 assert s == 200 and exported["track"] == "pocketful" and exported["format_version"] == 1
 saved_balance = call("GET", "/me", token=tokens["ada"])[1]["balance"]
@@ -100,9 +102,17 @@ tampered = copy.deepcopy(exported)
 next(iter(tampered["state"]["payments"].values()))["to_user_id"] = "missing-user"
 assert call("POST", "/_test/import", tampered)[0] == 422
 assert call("GET", "/me", token=tokens["ada"])[1]["balance"] == saved_balance
+tampered = copy.deepcopy(exported)
+payment_ids = list(tampered["state"]["payment_sequence"])
+tampered["state"]["payment_sequence"][payment_ids[1]] = tampered["state"]["payment_sequence"][payment_ids[0]]
+assert call("POST", "/_test/import", tampered)[0] == 422
+assert call("GET", "/me", token=tokens["ada"])[1]["balance"] == saved_balance
 assert call("POST", "/payments", {"to_handle":"bob","amount":11}, tokens["ada"], "after-export")[0] == 201
 assert call("POST", "/_test/import", exported)[0] == 204
 assert call("GET", "/me", token=tokens["ada"])[1]["balance"] == saved_balance
+for _ in range(30):
+    assert [p["payment_id"] for p in call("GET", "/activity", token=tokens["ada"])[1]["payments"]] == activity_order
+    assert [q["request_id"] for q in call("GET", "/requests", token=tokens["ada"])[1]["requests"]] == request_order
 assert call("POST", "/payments", {"to_handle":"bob","amount":7}, tokens["ada"], "concurrent")[0] == 200
 assert call("POST", "/auth/login", {"email":"ada@example.com","password":"correct horse"})[0] == 200
 

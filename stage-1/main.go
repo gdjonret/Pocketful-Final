@@ -69,6 +69,8 @@ type State struct {
 	Users       map[string]*User      `json:"users"`
 	Payments    map[string]*Payment   `json:"payments"`
 	Requests    map[string]*Request   `json:"requests"`
+	PaymentSeq  map[string]int64      `json:"payment_sequence"`
+	RequestSeq  map[string]int64      `json:"request_sequence"`
 	Tokens      map[string]string     `json:"tokens"`
 	Operators   map[string]bool       `json:"operators"`
 	Idempotency map[string]IdemRecord `json:"idempotency"`
@@ -92,7 +94,7 @@ func (e *apiError) Error() string               { return e.code }
 func ae(status int, code, msg string) *apiError { return &apiError{status, code, msg} }
 
 func emptyState() State {
-	return State{Currency: "EUR", MinorUnits: 2, Users: map[string]*User{}, Payments: map[string]*Payment{}, Requests: map[string]*Request{}, Tokens: map[string]string{}, Operators: map[string]bool{}, Idempotency: map[string]IdemRecord{}, Next: 1}
+	return State{Currency: "EUR", MinorUnits: 2, Users: map[string]*User{}, Payments: map[string]*Payment{}, Requests: map[string]*Request{}, PaymentSeq: map[string]int64{}, RequestSeq: map[string]int64{}, Tokens: map[string]string{}, Operators: map[string]bool{}, Idempotency: map[string]IdemRecord{}, Next: 1}
 }
 func main() {
 	s := &Server{st: emptyState()}
@@ -418,6 +420,7 @@ func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
 			}
 			ns.Seq++
 			ns.Payments[id] = &Payment{id, f, ns.Users[f].Handle, t, ns.Users[t].Handle, int64(am), cur, n, v, nil, nil, now(), ns.Seq}
+			ns.PaymentSeq[id] = ns.Seq
 		}
 		return true
 	}
@@ -446,6 +449,7 @@ func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
 			}
 			ns.Seq++
 			ns.Requests[id] = &Request{id, rq, ns.Users[rq].Handle, py, ns.Users[py].Handle, int64(am), cur, n, st, nil, now(), ns.Seq}
+			ns.RequestSeq[id] = ns.Seq
 		}
 		return true
 	}
@@ -490,7 +494,21 @@ func (s *Server) importState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var ns State
-	if json.Unmarshal(b, &ns) != nil || ns.Currency == "" || ns.Users == nil || ns.Payments == nil || ns.Requests == nil || ns.Tokens == nil || ns.Idempotency == nil || ns.Operators == nil || !s.validState(&ns) {
+	if json.Unmarshal(b, &ns) != nil || ns.Currency == "" || ns.Users == nil || ns.Payments == nil || ns.Requests == nil || ns.PaymentSeq == nil || ns.RequestSeq == nil || ns.Tokens == nil || ns.Idempotency == nil || ns.Operators == nil {
+		fail(w, ae(422, "validation_failed", "invalid state"))
+		return
+	}
+	for id, p := range ns.Payments {
+		if p != nil {
+			p.Seq = ns.PaymentSeq[id]
+		}
+	}
+	for id, q := range ns.Requests {
+		if q != nil {
+			q.Seq = ns.RequestSeq[id]
+		}
+	}
+	if !s.validState(&ns) {
 		fail(w, ae(422, "validation_failed", "invalid state"))
 		return
 	}
@@ -520,14 +538,20 @@ func (s *Server) validState(st *State) bool {
 	if total != st.SeedTotal {
 		return false
 	}
+	if len(st.PaymentSeq) != len(st.Payments) || len(st.RequestSeq) != len(st.Requests) {
+		return false
+	}
+	sequences := map[int64]bool{}
 	for id, p := range st.Payments {
 		if p == nil {
 			return false
 		}
 		from, to := st.Users[p.FromUserID], st.Users[p.ToUserID]
-		if p.ID != id || id == "" || len(id) > 64 || from == nil || to == nil || from.ID == to.ID || p.FromHandle != from.Handle || p.ToHandle != to.Handle || p.Amount < 1 || p.Amount > 1000000000 || p.Currency != st.Currency || len([]rune(p.Note)) > 200 || (p.Visibility != "public" && p.Visibility != "private") || p.Seq < 0 {
+		sequence, sequenceOK := st.PaymentSeq[id]
+		if p.ID != id || id == "" || len(id) > 64 || from == nil || to == nil || from.ID == to.ID || p.FromHandle != from.Handle || p.ToHandle != to.Handle || p.Amount < 1 || p.Amount > 1000000000 || p.Currency != st.Currency || len([]rune(p.Note)) > 200 || (p.Visibility != "public" && p.Visibility != "private") || !sequenceOK || sequence < 1 || sequence > st.Seq || p.Seq != sequence || sequences[sequence] {
 			return false
 		}
+		sequences[sequence] = true
 		if _, err := time.Parse(time.RFC3339Nano, p.CreatedAt); err != nil {
 			return false
 		}
@@ -546,9 +570,11 @@ func (s *Server) validState(st *State) bool {
 			return false
 		}
 		rq, py := st.Users[q.RequesterID], st.Users[q.PayerID]
-		if q.ID != id || id == "" || len(id) > 64 || rq == nil || py == nil || rq.ID == py.ID || q.RequesterHandle != rq.Handle || q.PayerHandle != py.Handle || q.Amount < 0 || q.Amount > 1000000000 || q.Currency != st.Currency || len([]rune(q.Note)) > 200 || !validStatus(q.Status) || q.Seq < 0 {
+		sequence, sequenceOK := st.RequestSeq[id]
+		if q.ID != id || id == "" || len(id) > 64 || rq == nil || py == nil || rq.ID == py.ID || q.RequesterHandle != rq.Handle || q.PayerHandle != py.Handle || q.Amount < 0 || q.Amount > 1000000000 || q.Currency != st.Currency || len([]rune(q.Note)) > 200 || !validStatus(q.Status) || !sequenceOK || sequence < 1 || sequence > st.Seq || q.Seq != sequence || sequences[sequence] {
 			return false
 		}
+		sequences[sequence] = true
 		if _, err := time.Parse(time.RFC3339Nano, q.CreatedAt); err != nil {
 			return false
 		}
@@ -726,6 +752,7 @@ func (s *Server) move(from, to *User, a int64, n, v string, rid, sid *string) *P
 	s.st.Seq++
 	p := &Payment{s.next("p"), from.ID, from.Handle, to.ID, to.Handle, a, s.st.Currency, n, v, rid, sid, now(), s.st.Seq}
 	s.st.Payments[p.ID] = p
+	s.st.PaymentSeq[p.ID] = p.Seq
 	return p
 }
 func (s *Server) createRequest(w http.ResponseWriter, r *http.Request, u *User) {
@@ -775,6 +802,7 @@ func (s *Server) newRequest(rq, py *User, a int64, n string) *Request {
 	s.st.Seq++
 	q := &Request{s.next("rq"), rq.ID, rq.Handle, py.ID, py.Handle, a, s.st.Currency, n, "pending", nil, now(), s.st.Seq}
 	s.st.Requests[q.ID] = q
+	s.st.RequestSeq[q.ID] = q.Seq
 	return q
 }
 func (s *Server) requestAction(w http.ResponseWriter, r *http.Request, u *User) {
@@ -1113,6 +1141,7 @@ func (s *Server) settlement(w http.ResponseWriter, r *http.Request, u *User) {
 		s.st.Seq++
 		p := &Payment{s.next("p"), t.f.ID, t.f.Handle, t.t.ID, t.t.Handle, t.a, s.st.Currency, t.n, t.v, nil, &sid, committed, s.st.Seq}
 		s.st.Payments[p.ID] = p
+		s.st.PaymentSeq[p.ID] = p.Seq
 		ps = append(ps, p)
 	}
 	res := map[string]any{"settlement_id": sid, "committed_at": committed, "payments": ps}
