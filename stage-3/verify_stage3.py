@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Independent Stage 3 smoke/regression checks against a disposable container."""
-import concurrent.futures, json, subprocess, time, urllib.error, urllib.request
+import concurrent.futures, json, subprocess, time, urllib.error, urllib.parse, urllib.request
 
 PORT=18083; BASE=f"http://127.0.0.1:{PORT}"
 def call(method,path,body=None,token=None,key=None):
@@ -36,5 +36,21 @@ try:
   must(call("GET","/statement?snapshot="+snap+"&limit=1",token=ta)[1]["closing_balance"]==900,"snapshot stability")
   must(len(call("GET","/payments/seed/revisions",token=tb)[1]["revisions"])==2,"revision permission")
   exp=call("GET","/_test/export")[1]; must(call("POST","/_test/import",exp)[0]==204,"round trip")
+  # Emulate a Stage 2 export: closed authorization and capture links exist, but
+  # Stage 3 ledger metadata does not. Import must reconstruct its historical hold.
+  fixture["payments"]=[]; fixture["users"][0]["balance"]=100; fixture["users"][1]["balance"]=0
+  must(call("POST","/_test/reset",fixture)[0]==204)
+  ta=call("POST","/auth/login",{"email":"a@x","password":"password1"})[1]["token"]
+  tb=call("POST","/auth/login",{"email":"b@x","password":"password1"})[1]["token"]
+  auth=call("POST","/authorizations",{"to_handle":"b","amount":60},ta,"auth-migrate")[1]
+  time.sleep(.01)
+  must(call("POST",f"/authorizations/{auth['authorization_id']}/capture",{},tb,"capture-migrate")[0]==201)
+  old=call("GET","/_test/export")[1]
+  for field in ("opening_balances","revisions","hold_events","reset_at"): old["state"].pop(field,None)
+  for value in old["state"]["authorizations"].values(): value.pop("closed_at",None)
+  must(call("POST","/_test/import",old)[0]==204,"stage2 migration")
+  at=urllib.parse.quote(auth["created_at"],safe="")
+  historical=call("GET",f"/me?as_of={at}",token=ta)[1]
+  must((historical["total"],historical["held"],historical["available"])==(100,60,40),"imported hold history")
   print("PASS: stage3 timestamps/opening/statements/snapshots/corrections/concurrency/import")
 finally: subprocess.run(["docker","stop",cid],stdout=subprocess.DEVNULL)

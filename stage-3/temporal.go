@@ -51,8 +51,53 @@ func (s *Server) ensureLedger() {
 		}
 	}
 	for id, a := range s.st.Authorizations {
-		if len(s.st.HoldEvents[id]) == 0 && a.Status == "open" {
-			s.st.HoldEvents[id] = []HoldEvent{{a.CreatedAt, a.CreatedAt, a.RemainingAmount}}
+		if len(s.st.HoldEvents[id]) != 0 {
+			continue
+		}
+		capturePayments := make([]*Payment, 0, len(a.PaymentIDs))
+		seen := map[string]bool{}
+		for _, paymentID := range a.PaymentIDs {
+			if p := s.st.Payments[paymentID]; p != nil && p.AuthorizationID != nil && *p.AuthorizationID == id {
+				capturePayments = append(capturePayments, p)
+				seen[p.ID] = true
+			}
+		}
+		// Stage 2 exports normally carry payment_ids, but accept the equivalent
+		// reverse links too so migration does not depend on redundant metadata.
+		for _, p := range s.st.Payments {
+			if p.AuthorizationID != nil && *p.AuthorizationID == id && !seen[p.ID] {
+				capturePayments = append(capturePayments, p)
+			}
+		}
+		sort.Slice(capturePayments, func(i, j int) bool {
+			ti, _ := time.Parse(time.RFC3339Nano, capturePayments[i].CreatedAt)
+			tj, _ := time.Parse(time.RFC3339Nano, capturePayments[j].CreatedAt)
+			if ti.Equal(tj) {
+				return capturePayments[i].ID < capturePayments[j].ID
+			}
+			return ti.Before(tj)
+		})
+		if a.Status == "open" || len(capturePayments) > 0 {
+			remaining := a.Amount
+			events := []HoldEvent{{At: a.CreatedAt, RecordedAt: a.CreatedAt, Remaining: remaining}}
+			for i, p := range capturePayments {
+				remaining -= p.Amount
+				if remaining < 0 {
+					remaining = 0
+				}
+				if a.Status != "open" && i == len(capturePayments)-1 {
+					remaining = 0
+				}
+				events = append(events, HoldEvent{At: p.CreatedAt, RecordedAt: p.CreatedAt, Remaining: remaining})
+			}
+			s.st.HoldEvents[id] = events
+			if a.Status != "open" && len(capturePayments) > 0 && a.ClosedAt == nil {
+				x := capturePayments[len(capturePayments)-1].CreatedAt
+				a.ClosedAt = &x
+			}
+		} else if a.Status == "expired" && a.ClosedAt == nil {
+			x := a.ExpiresAt
+			a.ClosedAt = &x
 		}
 	}
 }
