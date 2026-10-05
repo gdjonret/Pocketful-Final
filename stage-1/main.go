@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"regexp"
@@ -213,6 +214,15 @@ func checkPassword(encoded, p string) bool {
 	got := derive([]byte(p), s, 120000)
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
+func validPasswordHash(encoded string) bool {
+	parts := strings.Split(encoded, ":")
+	if len(parts) != 2 {
+		return false
+	}
+	salt, saltErr := hex.DecodeString(parts[0])
+	digest, digestErr := hex.DecodeString(parts[1])
+	return saltErr == nil && digestErr == nil && len(salt) == 16 && len(digest) == sha256.Size
+}
 func (s *Server) userByHandle(h string) *User {
 	for _, u := range s.st.Users {
 		if u.Handle == h {
@@ -377,6 +387,10 @@ func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
 		ns.Users[id] = u
 		handles[h] = true
 		emails[email] = true
+		if ns.SeedTotal > math.MaxInt64-int64(b) {
+			fail(w, ae(422, "validation_failed", "seed total exceeds arithmetic range"))
+			return
+		}
 		ns.SeedTotal += int64(b)
 	}
 	loadPayments := func() bool {
@@ -484,16 +498,93 @@ func (s *Server) importState(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 func (s *Server) validState(st *State) bool {
+	expectedMinorUnits := map[string]int{"EUR": 2, "JPY": 0, "BHD": 3}
+	minorUnits, currencyOK := expectedMinorUnits[st.Currency]
+	if !currencyOK || st.MinorUnits != minorUnits || st.Next < 1 || st.Seq < 0 || st.SeedTotal < 0 {
+		return false
+	}
 	var total int64
 	handles := map[string]bool{}
+	emails := map[string]bool{}
 	for id, u := range st.Users {
-		if u == nil || u.ID != id || u.Balance < 0 || u.Balance > maxSafeInteger || handles[u.Handle] {
+		if u == nil || u.ID != id || id == "" || len(id) > 64 || !emailRE.MatchString(u.Email) || !validPasswordHash(u.PasswordHash) || !handleRE.MatchString(u.Handle) || u.Balance < 0 || u.Balance > maxSafeInteger || handles[u.Handle] || emails[u.Email] {
 			return false
 		}
 		handles[u.Handle] = true
+		emails[u.Email] = true
+		if total > math.MaxInt64-u.Balance {
+			return false
+		}
 		total += u.Balance
 	}
-	return total == st.SeedTotal
+	if total != st.SeedTotal {
+		return false
+	}
+	for id, p := range st.Payments {
+		if p == nil {
+			return false
+		}
+		from, to := st.Users[p.FromUserID], st.Users[p.ToUserID]
+		if p.ID != id || id == "" || len(id) > 64 || from == nil || to == nil || from.ID == to.ID || p.FromHandle != from.Handle || p.ToHandle != to.Handle || p.Amount < 1 || p.Amount > 1000000000 || p.Currency != st.Currency || len([]rune(p.Note)) > 200 || (p.Visibility != "public" && p.Visibility != "private") || p.Seq < 0 {
+			return false
+		}
+		if _, err := time.Parse(time.RFC3339Nano, p.CreatedAt); err != nil {
+			return false
+		}
+		if p.RequestID != nil {
+			q := st.Requests[*p.RequestID]
+			if q == nil || q.Status != "paid" || q.PaymentID == nil || *q.PaymentID != p.ID || q.PayerID != p.FromUserID || q.RequesterID != p.ToUserID || q.Amount != p.Amount {
+				return false
+			}
+		}
+		if p.SettlementID != nil && (*p.SettlementID == "" || len(*p.SettlementID) > 64 || p.RequestID != nil) {
+			return false
+		}
+	}
+	for id, q := range st.Requests {
+		if q == nil {
+			return false
+		}
+		rq, py := st.Users[q.RequesterID], st.Users[q.PayerID]
+		if q.ID != id || id == "" || len(id) > 64 || rq == nil || py == nil || rq.ID == py.ID || q.RequesterHandle != rq.Handle || q.PayerHandle != py.Handle || q.Amount < 0 || q.Amount > 1000000000 || q.Currency != st.Currency || len([]rune(q.Note)) > 200 || !validStatus(q.Status) || q.Seq < 0 {
+			return false
+		}
+		if _, err := time.Parse(time.RFC3339Nano, q.CreatedAt); err != nil {
+			return false
+		}
+		if q.Status == "paid" {
+			if q.PaymentID == nil || st.Payments[*q.PaymentID] == nil {
+				return false
+			}
+		} else if q.PaymentID != nil {
+			return false
+		}
+	}
+	for token, userID := range st.Tokens {
+		if token == "" || st.Users[userID] == nil {
+			return false
+		}
+	}
+	for userID, enabled := range st.Operators {
+		if !enabled || st.Users[userID] == nil {
+			return false
+		}
+	}
+	for scope, record := range st.Idempotency {
+		parts := strings.Split(scope, "\x00")
+		var body any
+		var response any
+		if len(parts) != 4 || st.Users[parts[0]] == nil || parts[1] != record.Method || parts[2] != record.Path || parts[3] == "" || len(parts[3]) > 255 || record.Method != "POST" || json.Unmarshal([]byte(record.Body), &body) != nil || json.Unmarshal(record.Response, &response) != nil {
+			return false
+		}
+		if _, ok := body.(map[string]any); !ok {
+			return false
+		}
+		if _, ok := response.(map[string]any); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 var emailRE = regexp.MustCompile(`^[^@]+@[^@]+$`)
@@ -1015,9 +1106,10 @@ func (s *Server) settlement(w http.ResponseWriter, r *http.Request, u *User) {
 	sid := s.next("st")
 	committed := now()
 	ps := []*Payment{}
+	for id, d := range delta {
+		s.st.Users[id].Balance += d
+	}
 	for _, t := range txs {
-		s.st.Users[t.f.ID].Balance -= t.a
-		s.st.Users[t.t.ID].Balance += t.a
 		s.st.Seq++
 		p := &Payment{s.next("p"), t.f.ID, t.f.Handle, t.t.ID, t.t.Handle, t.a, s.st.Currency, t.n, t.v, nil, &sid, committed, s.st.Seq}
 		s.st.Payments[p.ID] = p

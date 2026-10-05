@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Black-box acceptance checks. Run against an already-started container."""
 import concurrent.futures
+import copy
 import json
 import os
 import urllib.error
@@ -91,6 +92,14 @@ assert call("GET", "/me", token=tokens["ada"])[1]["balance"] == before - 7
 s, exported = call("GET", "/_test/export")
 assert s == 200 and exported["track"] == "pocketful" and exported["format_version"] == 1
 saved_balance = call("GET", "/me", token=tokens["ada"])[1]["balance"]
+tampered = copy.deepcopy(exported)
+tampered["state"]["currency"] = "USD"
+assert call("POST", "/_test/import", tampered)[0] == 422
+assert call("GET", "/me", token=tokens["ada"])[1]["balance"] == saved_balance
+tampered = copy.deepcopy(exported)
+next(iter(tampered["state"]["payments"].values()))["to_user_id"] = "missing-user"
+assert call("POST", "/_test/import", tampered)[0] == 422
+assert call("GET", "/me", token=tokens["ada"])[1]["balance"] == saved_balance
 assert call("POST", "/payments", {"to_handle":"bob","amount":11}, tokens["ada"], "after-export")[0] == 201
 assert call("POST", "/_test/import", exported)[0] == 204
 assert call("GET", "/me", token=tokens["ada"])[1]["balance"] == saved_balance
