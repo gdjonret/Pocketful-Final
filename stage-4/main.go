@@ -818,6 +818,32 @@ func (s *Server) validState(st *State) bool {
 			return false
 		}
 	}
+	refundTotals := map[string]int64{}
+	for _, p := range st.Payments {
+		if p.RefundOf == nil {
+			continue
+		}
+		target := st.Payments[*p.RefundOf]
+		if target == nil || target.RefundOf != nil || p.ID == target.ID ||
+			p.FromUserID != target.ToUserID || p.ToUserID != target.FromUserID ||
+			p.Note != target.Note || p.Visibility != target.Visibility ||
+			p.RequestID != nil || p.AuthorizationID != nil || p.SettlementID != nil {
+			return false
+		}
+		if refundTotals[target.ID] > math.MaxInt64-p.Amount {
+			return false
+		}
+		refundTotals[target.ID] += p.Amount
+	}
+	for targetID, refunded := range refundTotals {
+		ceiling := st.Payments[targetID].Amount
+		if revisions := st.Revisions[targetID]; len(revisions) > 0 {
+			ceiling = revisions[len(revisions)-1].Amount
+		}
+		if refunded > ceiling {
+			return false
+		}
+	}
 	for id, q := range st.Requests {
 		if q == nil {
 			return false

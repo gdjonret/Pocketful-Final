@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import concurrent.futures,json,subprocess,time,urllib.error,urllib.request
+import concurrent.futures,copy,json,subprocess,time,urllib.error,urllib.request
 PORT=18084;BASE=f"http://127.0.0.1:{PORT}"
 def c(method,path,body=None,tok=None,key=None):
  d=None if body is None else json.dumps(body).encode();h={}
@@ -22,6 +22,9 @@ try:
  ta=c("POST","/auth/login",{"email":"a@x","password":"password1"})[1]["token"];tb=c("POST","/auth/login",{"email":"b@x","password":"password1"})[1]["token"]
  p=c("POST","/payments",{"to_handle":"b","amount":400,"note":"x","visibility":"private"},ta,"p")[1];must(p["refund_of"] is None,"null link")
  key="r";r=c("POST",f"/payments/{p['payment_id']}/refunds",{"amount":150},tb,key);must(r[0]==201 and r[1]["refund_of"]==p["payment_id"],"refund");must(c("POST",f"/payments/{p['payment_id']}/refunds",{"amount":150},tb,key)[0]==200,"refund replay")
+ good=c("GET","/_test/export")[1];tampered=copy.deepcopy(good);tampered["state"]["payments"][r[1]["payment_id"]]["refund_of"]="missing-payment"
+ must(c("POST","/_test/import",tampered)[0]==422,"dangling refund import")
+ must(c("GET","/_test/export")[1]==good,"atomic import rejection")
  must(c("POST",f"/payments/{r[1]['payment_id']}/refunds",{"amount":1},ta,"bad")[1]["error"]["code"]=="invalid_refund_target","refund target")
  eff=p["created_at"];body={"expected_revision":1,"amount":100,"effective_at":eff,"reason":"too low"};must(c("POST",f"/payments/{p['payment_id']}/corrections",body,ta,"floor")[1]["error"]["code"]=="refund_exceeds_payment","floor")
  body={"corrections":[{"payment_id":p["payment_id"],"expected_revision":1,"amount":250,"effective_at":eff,"reason":"adjust"}]};first=c("POST","/correction-batches",body,ta,"batch");must(first[0]==201 and first[1]["revisions"][0]["correction_batch_id"]==first[1]["correction_batch_id"],"batch");must(c("POST","/correction-batches",body,ta,"batch")[0]==200,"batch replay")
