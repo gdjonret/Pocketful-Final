@@ -48,4 +48,11 @@ assert call("POST","/_test/import",exported)[0]==204
 assert call("GET","/me",token=tok["ada"])[1]==before
 assert call("POST",f'/authorizations/{a["authorization_id"]}/capture',{"amount":700,"final":False},tok["bob"],"cap-1")[:2]==(200,p1)
 balances=[call("GET","/me",token=tok[x])[1]["total"] for x in ("ada","bob","cy")];assert sum(balances)==12500 and all(call("GET","/me",token=tok[x])[1]["available"]>=0 for x in ("ada","bob","cy"))
+# Fixture-valid historical closed authorizations have no required capture receipt metadata.
+closed=dict(fixture);closed["authorizations"]=[{"id":"seed_closed","from_user_id":"u_a","to_user_id":"u_b","amount":50,"note":"","visibility":"public","status":"captured","expires_at":future}]
+assert call("POST","/_test/reset",closed)[0]==204
+closed_export=call("GET","/_test/export")[1]
+assert call("POST","/_test/import",closed_export)[0]==204
+restored=call("GET","/authorizations",token=call("POST","/auth/login",{"email":"a@example.com","password":"correct horse"})[1]["token"])[1]["authorizations"][0]
+assert restored["authorization_id"]=="seed_closed" and restored["status"]=="captured" and restored["captured_amount"]==0 and restored["payment_id"] is None
 print("PASS: stage2 holds/captures/expiry/idempotency/concurrency/export-import/content-negotiation")
